@@ -1,0 +1,429 @@
+import ee
+import eemont 
+import geemap as gm
+import geemap.foliumap as gmf
+import geemap.colormaps as cm
+import geopandas as gpd
+import json
+import pandas as pd
+import numpy as np
+from matplotlib import pyplot as plt
+import streamlit as st
+import os
+import fiona
+from datetime import date
+from datetime import datetime
+import tempfile
+import shutil
+import io
+
+#Initialize the google earth engine python API.
+gm.Map()
+
+# Upload a geojson file and convert it to a ee.object FeatureCollection
+def uploaded_file_to_gdf(data):
+    file_path = data.getvalue()  # Access file content as bytes
+    with io.BytesIO(file_path) as file_object:
+        try:    
+            # Read the file GeoJson with Geopandas that provide shortcuts to process geo-files 
+            # easily than JSON methods and create a Geo-Data Frame with the Data store in the
+            # file.
+            gdf = gpd.read_file(file_object, driver="GeoJSON")
+            # Verify if a geometry is type 'MultiPolygon'.
+            has_multi_polygon = any(gdf['geometry'].apply(lambda geom: geom.type == 'MultiPolygon'))
+            # If a geometry is type 'MultiPolygon'. we apply the Geopandas method '.explode()'
+            # to convert the geometry type 'MultiPolygon' to type 'Polygon', this one is better
+            # for work with Google Earth Engine methods.
+            if has_multi_polygon:
+                gdf = gdf.explode(index_parts=False)
+            # At the following link you can analyze all about crs and understand why it's  
+            # important use it in your geoanalysis always "https://www.earthdatascience.org/
+            # courses/earth-analytics/spatial-data-r/intro-to-coordinate-reference-systems/"
+            gdf = gdf.to_crs("EPSG:4326")
+            # With the following variables we build the longitude and latitude for each geometry
+            # in the rows of the Geo-Data Frame of Geopandas for accuracy analysis.
+            gdf["lon"] = gdf["geometry"].centroid.x
+            gdf["lat"] = gdf["geometry"].centroid.y
+            # This return a Geo-Data Frame of Geopandas.
+            return gdf
+        except fiona.errors.DriverError:
+            raise ValueError("Invalid data type. Expected a GeoJSON format.")
+
+#Store the Data Frames generetaded by a user.
+if 'results_dict' not in st.session_state:
+    st.session_state.results_dict = {}
+#Get the GeoJson data to a Json geometry to build the ee object ee.Feature Collection and a
+#function to perform Earth Engine Analysis.
+def perform_earth_engine_analysis(polygon, index_option, initial_start_date, initial_end_date):
+    #Create an ee.Feature Collection to Perform the Analysis.
+    polygon_ee = ee.FeatureCollection([polygon])
+
+    # Create a unique key by name and index of analysis.
+    key = f"{selected_name}_{index_option}"
+
+    # Verify if a Data Frame already exists in the active Streamlit app session if not create it.
+    if key not in st.session_state.results_dict:
+        st.session_state.results_dict[key] = pd.DataFrame(columns=["Nombre", "Start Date", "End Date", "Index Analyzed", "Mean Value", "Percentage Change"])
+    df = st.session_state.results_dict[key]
+
+    # Verify if a special key already exits for a name and index analyzed.
+    if key in st.session_state.results_dict:
+        # If already exists return the Data Frame with the stored results.
+        df = st.session_state.results_dict[key]
+    else:
+        # If don't exists allow to create the Data Frame.
+        df = pd.DataFrame(columns=["Nombre", "Start Date", 
+                                   "End Date", "Index Analyzed", 
+                                   "Mean Value", "Percentage Change"])
+        st.session_state.results_dict[key] = df
+
+    # A function to fill holes in the whole analysis produced by a high percentage of
+    # clouds or darks in the image of analysis.
+    def fillGaps(image, index_name):
+        no_data_mask = image.select(index_name).mask().Not()
+        interpolated_index = image.select(index_name).unmask(0)
+        return image.addBands(interpolated_index.rename(index_name), overwrite=True)
+
+    # Set up the parameters of analysis.
+    # Select the index of analysis.
+    index_name = index_option
+    if index_name not in ['EVI', 'GNDVI', "NDVI", 'NDWI', "SAVI"]:
+        raise ValueError("Index not supported. Please choose from: EVI, GNDVI, NDVI, NDWI or SAVI")
+    #Slect a date range of analysis setting each date . 
+    if initial_start_date >= initial_end_date:  # Ensure start date is before end date
+        st.error("End Date must be after Start Date.")
+        return
+    #Convert each date selected to a Google Earth Engine Date.
+    start_date = ee.Date(initial_start_date.strftime("%Y-%m-%d"))
+    end_date = ee.Date(initial_end_date.strftime("%Y-%m-%d"))
+    
+    #This try except block performs the analysis.
+    try:
+        #Analyzing the index 'EVI'.
+        if index_name == "EVI":
+            #This is the formula tu calculate the index 'EVI' using the satellite SENTYINEL 2.
+            evi_expression = '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))'
+
+            #Setting the parameters of analysis for the satellite SENTINEL 2 
+            #and locating the area of analysis inside our AOI (Area of Interest= polygon_ee).
+            s2 = (ee.ImageCollection('COPERNICUS/S2_SR')
+                    .filterBounds(polygon_ee)
+                    .maskClouds(prob=80, dark=0.05)
+                    .filterDate(start_date, end_date)
+                    .scaleAndOffset())
+            #Creating a collection of individual images where the satellite SENTINEL 2 
+            # analyzed the percentage of index 'EVI' inside the polygon_ee.
+            evi_collection = s2.map(lambda img: img.expression(evi_expression, {
+                'NIR': img.select('B8'),  # Near-infrared band (B8)
+                'RED': img.select('B4'),  # Red band (B4)
+                'BLUE': img.select('B2')  # Blue band (B2)
+            }).rename('EVI'))
+            #Applying the function 'fillGaps' to the collection.
+            filled_index_collection = evi_collection.map(lambda img: fillGaps(img, 'EVI'))
+        #The same process explained for the index 'EVI'.
+        elif index_name == "SAVI":
+            savi_expression = '(NIR - RED) / (NIR + RED  + 0.428) * (1.428)'
+            s2 = (ee.ImageCollection('COPERNICUS/S2_SR')
+                    .filterBounds(polygon_ee)
+                    .maskClouds(prob=80, dark=0.05)
+                    .filterDate(start_date, end_date)
+                    .scaleAndOffset())
+            savi_collection = s2.map(lambda img: img.expression(savi_expression, {
+                'NIR': img.select('B8'),  # Near-infrared band (B8)
+                'RED': img.select('B4'),  # Red band (B4)
+            }).rename('SAVI'))
+            filled_index_collection = savi_collection.map(lambda img: fillGaps(img, 'SAVI'))
+        # Here we apply a different approach to calculate the index 'GNDVI', 'NDVI' and 'NDWI'.
+        # Due these indexes need only 2 bands from the satellite SENTINEL 2 to be calculated we 
+        # can use the Google Eart Engine method '.normalizedDifference()', that only works with 
+        # 2 bands to avoid set the the formula of analysis directly like when we analyzed the 
+        # indexes 'SAVI' and 'EVI'before using the method '.expression()'.
+        else:
+            band_mappings = {
+                "GNDVI": ["B8", "B3"],
+                "NDWI": ["B3", "B8"],
+                "NDVI": ["B8", "B4"]
+            }
+            bands = band_mappings.get(index_name, [])
+            s2 = (ee.ImageCollection('COPERNICUS/S2_SR')
+                    .filterBounds(polygon_ee)
+                    .maskClouds(prob=80, dark=0.05)
+                    .filterDate(start_date, end_date)
+                    .scaleAndOffset())
+            index_collection = s2.map(lambda img: img.normalizedDifference(bands).rename(index_name))
+            filled_index_collection = index_collection.map(lambda img: fillGaps(img, index_name))
+        
+        #In these variables we calculate the total index mean inside the AOI for the Date Range
+        # of analysis. The variable 'mean_index_to_map' will allow us to map the results and
+        # the AOI in a Geemap and 'mean_index' value will be store in the correpsonding column
+        # in a Data Frame to see the results. 
+        mean_index_to_map = filled_index_collection.mean().clip(polygon_ee)
+        mean_index = filled_index_collection.mean().reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=polygon_ee, scale=10
+        ).get(index_name)
+        # Get the mean value numeric result to passing to the Data Frame to the column 'Mean Value'.
+        mean_index_info = mean_index.getInfo() 
+
+        # If we want to analyze different Date Ranges and its percentage change between the last   
+        # one and the stored in the immediately previous row we must initialize the percentage
+        # change as None.  
+        percentage_change = None  
+        # Pass the results to the Data Frame only if an analysis was made and analyzing the 
+        # percentage change.
+        if not df.empty:
+                previous_value = df.iloc[-1]['Mean Value']
+                difference = mean_index_info - previous_value
+                percentage_change = (difference / previous_value) * 100 if previous_value != 0 else None
+        else:
+                percentage_change = None
+
+        # Add results to the Data Frame.
+        df = df._append({
+            "Nombre": selected_name,
+            "Start Date": initial_start_date,
+            "End Date": initial_end_date,
+            "Index Analyzed": index_name,
+            "Mean Value": mean_index_info,
+            "Percentage Change": percentage_change
+        }, ignore_index=True)
+
+        # Update the Data Frame in the Streamlit app session.
+        st.session_state.results_dict[key] = df
+
+        # Return the Data Frame linked with the session weather if it exist if not return 'None'.
+        data_frame = st.session_state.results_dict.get(key, None)
+
+        # Return the results of the function 'def perform_earth_engine_analysis(polygon, 
+        #index_option, initial_start_date, initial_end_date):'.
+        return {
+            'data_frame': data_frame,
+            'polygon_ee': polygon_ee,
+            'S2': s2,
+            'mean_index_to_map': mean_index_to_map,
+        }
+    except ee.EEException as e:
+        st.error(f"An error occurred: {e}")
+        return None
+
+# Mapping the AOI with GEEMAP and FOLIUM.
+def visualize_results_on_map(results):
+    # Defining the AOI to clip bounds and show only the index results inside it.
+    polygon_ee = results['polygon_ee']
+    # Calling the mean results to show it inside the AOI.
+    mean_index_to_map = results['mean_index_to_map']
+
+    # Defining the visualization parameters of the index analyzed to show the results in a 
+    #GEEMAP map.
+
+    #Selecting the index analyzed.
+    if index_option  == 'GNDVI':
+        #Parameters of visualization.
+        vis_params = {"min": 0, "max": 1, "palette": cm.palettes.ndvi}
+        #Crating the GEEMAP map for the Streamlit app.
+        m = gmf.Map()
+        #Using the Google Maps template for an accuracy Geolocalization.
+        url = 'https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}'
+        # Adding the template to the GEEMAP map.
+        m.add_tile_layer(url, name='Google Map', attribution='Google')
+        # Geolocalizating the AOI in the GEEMAP map.
+        m.center_object(polygon_ee, 13)
+        # Adding the results and its visualization parameters inside the AOI in the GEEMAP map.
+        m.addLayer(mean_index_to_map.clip(polygon_ee), vis_params, "GNDVI")
+        # Adding a bar inside the GEEMAP map to guide the user about the meaning of each color
+        # respect the index analyzed.
+        m.add_colorbar(vis_params, label="GNDVI INDEX", layer_name="GNDVI COLOR GUIDE", 
+                       orientation="bottomright")
+        
+    # The same explanation for the index 'GNDVI'
+    elif index_option  == 'NDWI':
+        vis_params = {"min": 0, "max": 1, "palette": cm.palettes.ndwi}
+        m = gmf.Map()
+        url = 'https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}'
+        m.add_tile_layer(url, name='Google Map', attribution='Google')
+        m.center_object(polygon_ee, 13)
+        m.addLayer(mean_index_to_map.clip(polygon_ee), vis_params, "NDWI")
+        m.add_colorbar(vis_params, label="NDWI INDEX", layer_name="NDWI COLOR GUIDE", 
+                       orientation="bottomright")
+
+    # The same explanation for the index 'GNDVI'
+    elif index_option  == 'EVI':
+        vis_params = {"min": 0, "max": 1, "palette": cm.palettes.ndvi}
+        m = gmf.Map()
+        url = 'https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}'
+        m.add_tile_layer(url, name='Google Map', attribution='Google')
+        m.center_object(polygon_ee, 13)
+        m.addLayer(mean_index_to_map.clip(polygon_ee), vis_params, "EVI")
+        m.add_colorbar(vis_params, label="EVI INDEX", layer_name="EVI COLOR GUIDE", 
+                       orientation="bottomright")
+
+    # The same explanation for the index 'GNDVI'
+    elif index_option  == 'SAVI':
+        vis_params = {"min": 0, "max": 1, "palette": cm.palettes.ndvi}
+        m = gmf.Map()
+        url = 'https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}'
+        m.add_tile_layer(url, name='Google Map', attribution='Google')
+        m.center_object(polygon_ee, 13)
+        m.addLayer(mean_index_to_map.clip(polygon_ee), vis_params, "SAVI")
+        m.add_colorbar(vis_params, label="SAVI INDEX", layer_name="SAVI COLOR GUIDE", 
+                       orientation="bottomright")
+
+    # The same explanation for the index 'GNDVI'
+    elif index_option  == 'NDVI':
+        vis_params = {"min": 0, "max": 1, "palette": cm.palettes.ndvi}
+        m = gmf.Map()
+        url = 'https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}'
+        m.add_tile_layer(url, name='Google Map', attribution='Google')
+        m.center_object(polygon_ee, 13)
+        m.addLayer(mean_index_to_map.clip(polygon_ee), vis_params, "NDVI")
+        m.add_colorbar(vis_params, label="NDVI INDEX", layer_name="NDVI COLOR GUIDE", 
+                       orientation="bottomright")
+
+    # Use context manager only for rendering the GEEMAP map in the Streamlit app.
+    with st.empty():  
+        m.to_streamlit(width=1000, height=500)
+    # Return the map object for rendering the GEEMAP map in the Streamlit app.
+    return m  
+
+#Display the results of the Data Frame in the Streamlit app.
+def display_results(data_frame):
+    st.subheader("Statistical Results:")
+    st.dataframe(data_frame)  
+
+# Function for clean data in the Data Frame.
+def limpiar_datos(key):
+    if key in st.session_state.results_dict:
+        st.session_state.results_dict[key] = pd.DataFrame(columns=["Nombre", "Start Date", 
+                                   "End Date", "Index Analyzed", 
+                                   "Mean Value", "Percentage Change"])
+        st.success("Datos limpiados exitosamente.")
+    else:
+        st.warning("No hay datos para limpiar.")
+
+# A function to verify that the file is a GeoJson.
+def handle_file_upload():
+    #Here we define the side in the Streamlit app where the user will see the box to upload the
+    # file and a info message about the format that can be upload.
+    data = st.sidebar.file_uploader("Upload a GeoJSON file", type=["geojson"], 
+                                    key="unique_key_1")
+    # Here we check if a file is upload or not and how to manage it.
+    if data is not None:
+        # Check for valid format.
+        if data.name.lower().endswith(".geojson"):  
+            try:
+                with st.spinner("Processing GeoJSON file..."):
+                    gdf = uploaded_file_to_gdf(data)  
+                    # Convert the file to a JSON object.
+                    gdf_js = json.loads(gdf.to_json())
+                st.success("GeoJSON file uploaded successfully!")
+                return gdf, gdf_js
+            except Exception as e:
+                st.error(f"Error processing GeoJSON file: {e}")  
+                # Return 'None' if an error is find.
+                return None, None 
+        else:
+            st.error("Invalid file format. Please upload a GeoJSON file.")  
+            # Return 'None' if an error is find.
+            return None, None  
+    # Return 'None' if no file is uploaded.
+    else:
+        return None, None  
+    
+# Sidebar in the Streamlit app.
+st.sidebar.title("Streamlit Earth Engine App")
+st.sidebar.subheader("Upload GeoJSON File")
+# The name of the Streamlit app.
+st.title("CDX Agriculture Precision App")
+
+# Handle file upload and proceed with analysis if successful.
+if __name__ == "__main__":
+    data, gdf_js = handle_file_upload()
+    
+    # Verify if a file was uploaded.
+    if data is not None and gdf_js is not None:
+        # Create a 'set' of unique names store in the file uploaded. 
+        unique_names = set()
+        # Get the unique names inside the GeoJSON file.
+        for feature in gdf_js['features']:
+            unique_names.add(feature['properties']['Nombre'])
+        # Convert the 'set' to a 'list' to use it in the breakdown menu where the user can chose
+        # a name that has a geometry linked to define the AOI of analysis.
+        unique_names_list = list(unique_names)
+        # Create a widget with a breakdown menu in the Streamlit app where the user can select 
+        # the name.
+        selected_name = st.selectbox("Select Person Name", unique_names_list)
+        # Since the name is slected we can analyze the features link to it and chose only the 
+        # geometry to define our AOI.
+        for feature in gdf_js['features']:
+            if feature['properties']['Nombre'] == selected_name:
+                polygon = feature
+                break
+        
+        # A breakdown menu with the options of indeces to analyze.
+        st.subheader("Index Selector:")
+        index_option = st.selectbox("Select Index", ["GNDVI", "NDVI", "EVI", "NDWI", "SAVI"])
+        st.write("Selected Index:", index_option)
+
+        #Create a date widget inside the Streamlit app to set up the dates of analysis. 
+        initial_start_date = st.date_input("Initial Start Date", date(2022, 1, 1))
+        initial_end_date = st.date_input("Initial End Date", date(2022, 2, 27))
+
+        # Button for clean data store in the Data Frame.
+        st.write("Presiona el botón, Limpiar Resultados, cuando quieras eliminar datos estadísticos almacenados en el cuadro de estadísticas.")
+        if st.button("Limpiar Resultados"):
+            key = f"{selected_name}_{index_option}"
+            limpiar_datos(key)
+
+        # Create a button widget inside the Streamlit app to perform the analysis only when
+        # the user press it.
+        if st.button("Ejecutar Análisis"):
+            # Perform the Analysis.
+            results = perform_earth_engine_analysis(polygon, index_option, initial_start_date,initial_end_date)
+            # Verify if after the analysis there are results or not.
+            if results is not None:
+                # Display Results Data Frame.
+                display_results(results['data_frame'])
+                # Display Results on GEEMAP map.
+                st.subheader("Results on Map:")
+                m = visualize_results_on_map(results)  
+                # Access the polygon_ee from the results.
+                polygon_ee = results['polygon_ee']
+                # Create a widget of a download button to allow the user download the results
+                # Data Frame, Map and the metadata from the polygon analyzed.
+                if st.button("Download Results"):
+                    # Create a temporary directory to store results.
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        # Convert polygon_ee to GeoJSON and save.
+                        # Get GeoJSON
+                        polygon_json = results['polygon_ee'].getInfo()  
+                        # Save as GeoJSON
+                        with open(os.path.join(temp_dir, "polygon.geojson"), "w") as f:
+                            json.dump(polygon_json, f)  
+                        # Save the folium map as html.
+                        map_html_path = os.path.join(temp_dir, "map.html")
+                        m.save(map_html_path)
+                        # Save Results DataFrame as CSV.
+                        df_csv_path = os.path.join(temp_dir, "results_data.csv")
+                        results['data_frame'].to_csv(df_csv_path, index=False)
+                        # Create a ZIP archive of the results
+                        zip_path = os.path.join(temp_dir, "results.zip")
+                        shutil.make_archive(zip_path.replace(".zip", ""), "zip", temp_dir)
+                        # Provide a download link using st.download_button
+                        st.download_button(
+                            label="Press here to Download Results",
+                            data=open(zip_path, "rb"),
+                            file_name="results.zip",
+                            mime="application/zip"
+                        )
+                        # Show a message to the user in the Streamlit app.
+                        st.subheader("Great work, it's successfully downloaded.")
+            # Show a message to the user when the software can't find results weather for the
+            # AOI or dates.
+            else:
+                st.warning("No valid results obtained. Please try again.")
+        # Create a message to guide the user through set the dates and press the button to 
+        # perform the analysis.
+        else:
+            st.info("Please set up the analysis dates and press 'Ejecutar Análisis' to proceed.")
+    else:
+        # Handle the case where no file is uploaded
+        st.info("Please upload a GeoJSON file to proceed with the analysis.")
